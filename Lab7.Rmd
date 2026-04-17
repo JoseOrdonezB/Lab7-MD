@@ -9,22 +9,100 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## R Markdown
+# Librerias
+```{r}
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
 ```
 
-## Including Plots
 
-You can also embed plots, for example:
+# Lectura de datos
+```{r lectura-datos}
+load('listings.RData')
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+dim(listings)
+print(names(listings))
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+# Limpieza de variables
+```{r limpieza-variables}
+listings$price_num <- as.numeric(gsub("[$,]", "", listings$price))
+
+listings_clean <- listings[!is.na(listings$price_num), ]
+
+cat("Filas originales      :", nrow(listings),       "\n")
+cat("Filas tras limpiar NAs:", nrow(listings_clean),  "\n")
+cat("Filas eliminadas      :", nrow(listings) - nrow(listings_clean), "\n")
+```
+
+# Categorizar precio
+```{r categorizar-precio}
+q33 <- quantile(listings_clean$price_num, 0.33, na.rm = TRUE)
+q66 <- quantile(listings_clean$price_num, 0.66, na.rm = TRUE)
+
+cat("Corte inferior (33%):", q33, "→ Económico\n")
+cat("Corte superior (66%):", q66, "→ Caro\n")
+
+listings_clean$price_category <- cut(
+  listings_clean$price_num,
+  breaks = c(-Inf, q33, q66, Inf),
+  labels = c("economico", "medio", "caro"),
+  right  = TRUE
+)
+
+cat("\nDistribución de la variable categórica de precio:\n")
+print(table(listings_clean$price_category))
+```
+
+# Inciso No. 1
+## Variables dicotómicas
+```{r variables-dicotomicas}
+listings_clean$es_caro      <- ifelse(
+  listings_clean$price_category == "caro",      1L, 0L)
+
+listings_clean$es_medio     <- ifelse(
+  listings_clean$price_category == "medio",     1L, 0L)
+
+listings_clean$es_economico <- ifelse(
+  listings_clean$price_category == "economico", 1L, 0L)
+```
+
+```{r tablas-dicotomicas}
+cat(" Es caro:")
+print(table(listings_clean$es_caro))
+
+cat("\n Es medio")
+print(table(listings_clean$es_medio))
+
+cat("\n Es económico")
+print(table(listings_clean$es_economico))
+```
+
+```{r verificar-coherencia}
+# Verificar si suman 1
+suma_check <- listings_clean$es_caro +
+              listings_clean$es_medio +
+              listings_clean$es_economico
+
+all(suma_check == 1)
+```
+Para preparar los datos de cara a los modelos de regresión logística, se transformó la variable categórica price_category en tres variables dicotómicas: es_caro, es_medio y es_economico. Cada una toma el valor 1 si la propiedad pertenece a esa categoría de precio y 0 en caso contrario. La verificación final confirma que de las tres variables queda asignada a exactamente una categoría.
+
+# Inciso No. 2
+## Separación datos de prueba y entrenamiento
+```{r train-test-split}
+set.seed(123)
+
+n <- nrow(listings_clean)
+train_index <- sample(seq_len(n), size = floor(0.70 * n), replace = FALSE)
+
+train_data <- listings_clean[ train_index, ]
+test_data <- listings_clean[-train_index, ]
+```
+
+```{r resumen-particion}
+cat("Total de observaciones :", n, "\n")
+cat("Entrenamiento (70%) :", nrow(train_data), "filas\n")
+cat("Prueba (30%) :", nrow(test_data), "filas\n")
+```
+Se fijó la semilla aleatoria en 123 y se dividió el dataset en un 70% para entrenamiento y un 30% para prueba, obteniendo 53,372 y 22,874 observaciones respectivamente.
+
