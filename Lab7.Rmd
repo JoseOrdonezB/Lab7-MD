@@ -11,7 +11,12 @@ knitr::opts_chunk$set(echo = TRUE)
 
 # Librerias
 ```{r}
-
+library(caret)
+library(dplyr)
+library(knitr)
+library(kableExtra)
+library(car)
+library(corrplot)
 ```
 
 
@@ -106,3 +111,202 @@ cat("Prueba (30%) :", nrow(test_data), "filas\n")
 ```
 Se fijó la semilla aleatoria en 123 y se dividió el dataset en un 70% para entrenamiento y un 30% para prueba, obteniendo 53,372 y 22,874 observaciones respectivamente.
 
+# Inciso No. 3
+## Preparación de predictores
+```{r predictores}
+vars_pred <- c("accommodates", "bedrooms", "beds", "bathrooms",
+               "room_type", "minimum_nights", "availability_365",
+               "number_of_reviews", "review_scores_rating",
+               "reviews_per_month", "calculated_host_listings_count",
+               "host_is_superhost", "instant_bookable")
+
+listings_clean$host_is_superhost_n <- ifelse(
+  listings_clean$host_is_superhost == "t", 1L,
+  ifelse(listings_clean$host_is_superhost == "f", 0L, NA_integer_))
+
+listings_clean$instant_bookable_n <- ifelse(
+  listings_clean$instant_bookable == "t", 1L, 0L)
+
+imputa_mediana <- function(x) {
+  x[is.na(x)] <- median(x, na.rm = TRUE)
+  x
+}
+
+listings_clean$bedrooms             <- imputa_mediana(listings_clean$bedrooms)
+listings_clean$beds                 <- imputa_mediana(listings_clean$beds)
+listings_clean$bathrooms            <- imputa_mediana(listings_clean$bathrooms)
+listings_clean$review_scores_rating <- imputa_mediana(listings_clean$review_scores_rating)
+listings_clean$reviews_per_month    <- imputa_mediana(listings_clean$reviews_per_month)
+
+# Variable respuesta como factor
+listings_clean$es_caro_f <- factor(
+  listings_clean$es_caro,
+  levels = c(0, 1),
+  labels = c("No", "Si")
+)
+
+listings_clean$host_is_superhost_n <- imputa_mediana(listings_clean$host_is_superhost_n)
+
+train_data <- listings_clean[ train_index, ]
+test_data  <- listings_clean[-train_index, ]
+
+cat("Predictores con NAs en train:\n")
+vars_modelo <- c("accommodates","bedrooms","beds","bathrooms","room_type",
+                 "minimum_nights","availability_365","number_of_reviews",
+                 "review_scores_rating","reviews_per_month",
+                 "calculated_host_listings_count",
+                 "host_is_superhost_n","instant_bookable_n")
+print(colSums(is.na(train_data[, vars_modelo])))
+```
+
+## Entrenamiento con validación cruzada de 10 pliegues
+```{r modelo logistico}
+set.seed(123)
+
+ctrl_cv <- trainControl(
+  method          = "cv",
+  number          = 10,
+  classProbs      = TRUE,          
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+formula_caro <- es_caro_f ~ accommodates + bedrooms + beds + bathrooms +
+                             room_type + minimum_nights + availability_365 +
+                             number_of_reviews + review_scores_rating +
+                             reviews_per_month + calculated_host_listings_count +
+                             host_is_superhost_n + instant_bookable_n
+
+modelo_caro <- caret::train(
+  formula_caro,
+  data      = train_data,
+  method    = "glm",
+  family    = binomial,
+  trControl = ctrl_cv,
+  metric    = "ROC"
+)
+
+cat("=== Resultados de validación cruzada ===\n")
+print(modelo_caro$results)
+```
+
+## Predicciones con umbral 0.5
+```{r}
+prob_caro_train <- predict(modelo_caro, newdata = train_data, type = "prob")[, "Si"]
+prob_caro_test  <- predict(modelo_caro, newdata = test_data,  type = "prob")[, "Si"]
+
+pred_train_05 <- factor(ifelse(prob_caro_train >= 0.5, "Si", "No"),
+                        levels = c("No", "Si"))
+pred_test_05  <- factor(ifelse(prob_caro_test  >= 0.5, "Si", "No"),
+                        levels = c("No", "Si"))
+
+cat("=== Matriz de confusión – conjunto de ENTRENAMIENTO ===\n")
+cm_train <- confusionMatrix(pred_train_05, train_data$es_caro_f, positive = "Si")
+print(cm_train)
+
+cat("\n=== Matriz de confusión – conjunto de PRUEBA ===\n")
+cm_test <- confusionMatrix(pred_test_05, test_data$es_caro_f, positive = "Si")
+print(cm_test)
+```
+El modelo de regresión logística entrenado con validación cruzada de 10 pliegues obtuvo un AUC de 0.8386, lo que refleja una buena capacidad para distinguir entre propiedades caras y no caras. Con el umbral de decisión fijado en 0.5, el modelo alcanzó una exactitud del 78.47% en el conjunto de prueba, es decir, clasifica correctamente casi 8 de cada 10 propiedades. Sin embargo, existe un desequilibrio notable entre sensibilidad (57.87%) y especificidad (88.97%): el modelo es muy bueno identificando propiedades que no son caras, pero se le escapa casi el 42% de las que sí lo son. Esto sugiere que el umbral de 0.5 es conservador para etiquetar una propiedad como cara, comportamiento que se analizará con mayor detalle.
+
+Un aspecto positivo es que la exactitud en entrenamiento (78.72%) y en prueba (78.47%) son prácticamente idénticas, con una diferencia de apenas 0.25 puntos porcentuales. Esto indica que el modelo generaliza bien y no presenta sobreajuste, lo que aprendió del conjunto de entrenamiento se traslada de manera consistente a datos que nunca había visto.
+
+# Inciso No. 4
+```{r coeficientes y significancia}
+coef_raw <- summary(modelo_caro$finalModel)$coefficients
+coef_df  <- as.data.frame(coef_raw)
+colnames(coef_df) <- c("Estimado", "Error.Std", "z.valor", "p.valor")
+coef_df$Variable   <- rownames(coef_df)
+coef_df$Sig        <- ifelse(coef_df$p.valor < 0.001, "***",
+                      ifelse(coef_df$p.valor < 0.01,  "**",
+                      ifelse(coef_df$p.valor < 0.05,  "*",
+                      ifelse(coef_df$p.valor < 0.1,   ".", ""))))
+coef_df <- coef_df[order(coef_df$p.valor), ]
+
+kable(coef_df[, c("Variable","Estimado","Error.Std","z.valor","p.valor","Sig")],
+      digits  = 4,
+      caption = "Coeficientes del modelo – ordenados por valor p") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) %>%
+  row_spec(which(coef_df$p.valor < 0.05),  background = "#d4edda") %>%
+  row_spec(which(coef_df$p.valor >= 0.05), background = "#fff3cd")
+```
+
+Las variables en verde son estadísticamente significativas (p < 0.05). Los coeficientes positivos aumentan la log-probabilidad de que la propiedad sea cara; los negativos la reducen. Los coeficientes de variables categóricas como room_type se interpretan respecto a la categoría de referencia.
+Al revisar la significancia de los coeficientes más a detalle, prácticamente todas las variables del modelo resultaron estadísticamente significativas. La excepción es room_typePrivate room, cuyo p-valor de 0.958 indica que no aporta información útil para distinguir propiedades caras respecto a la categoría de referencia. Entre los predictores más influyentes destacan bathrooms, con el coeficiente positivo más alto del modelo, lo que sugiere que cada baño adicional incrementa considerablemente la probabilidad de que una propiedad sea cara. 
+
+En la misma dirección, review_scores_rating también muestra un efecto positivo importante, lo cual tiene sentido: propiedades mejor valoradas suelen justificar precios más elevados. Por otro lado, room_typeShared room presenta el coeficiente más negativo de todos, reflejando que las habitaciones compartidas son las menos propensas a ubicarse 
+en la categoría cara, algo completamente coherente con la dinámica del mercado.
+
+## Factor de Inflación de la Varianza
+```{r vif-analisis}
+vif_vals <- vif(modelo_caro$finalModel)
+vif_df <- if (is.matrix(vif_vals)) {
+  data.frame(
+    Variable = rownames(vif_vals),
+    GVIF     = round(vif_vals[, 1], 3),
+    Df       = vif_vals[, 2],
+    VIF_adj  = round(vif_vals[, 3]^2, 3)  
+  )
+} else {
+  data.frame(Variable = names(vif_vals), VIF = round(vif_vals, 3))
+}
+
+vif_df <- vif_df[order(-vif_df[, ncol(vif_df)]), ]
+
+kable(vif_df, caption = "VIF por variable (>10 indica alta multicolinealidad)") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  row_spec(which(vif_df[, ncol(vif_df)] > 10), background = "#f8d7da") %>%
+  row_spec(which(vif_df[, ncol(vif_df)] <= 5),  background = "#d4edda")
+```
+
+Un VIF ≤ 5 (verde) es aceptable. Entre 5 y 10 requiere atención. Mayor a 10 (rojo) indicaría multicolinealidad problemática que infla los errores estándar de los coeficientes y dificulta su interpretación.
+El análisis VIF ofrece un panorama que nos puede tranquilizar, ninguna variable supera el umbral crítico de 10, ni siquiera el moderado de 5. Los valores más altos corresponden a accommodates, beds y bedrooms, lo cual era esperable dado que las tres variables describen esencialmente el mismo concepto: el tamaño del alojamiento. Aun así, sus VIF se mantienen por debajo de 4, por lo que no representan un problema para la estabilidad del modelo. 
+
+## Correlación entre predictores numéricos
+```{r correlacion de predictores}
+vars_num_corr <- c("accommodates","bedrooms","beds","bathrooms",
+                   "minimum_nights","availability_365","number_of_reviews",
+                   "review_scores_rating","reviews_per_month",
+                   "calculated_host_listings_count",
+                   "host_is_superhost_n","instant_bookable_n")
+
+mat_cor <- cor(train_data[, vars_num_corr], use = "complete.obs")
+
+corrplot(mat_cor,
+         method      = "color",
+         type        = "upper",
+         tl.cex      = 0.75,
+         addCoef.col = "black",
+         number.cex  = 0.55,
+         col         = colorRampPalette(c("#E74C3C","white","#2980B9"))(200),
+         title       = "Correlación entre Predictores Numéricos",
+         mar         = c(0, 0, 2, 0))
+```
+La matriz de correlación refuerza esta misma lectura. accommodates, bedrooms y beds presentan correlaciones altas entre sí, con valores cercanos a 0.80, mientras que el resto de los pares de variables muestran correlaciones débiles, generalmente por debajo de 0.30. Esto confirma que la redundancia en el modelo es puntual y acotada al grupo de variables de tamaño, sin comprometer la interpretabilidad del conjunto.
+
+
+## Ajuste del modelo
+```{r ajuste}
+aic_val     <- AIC(modelo_caro$finalModel)
+bic_val     <- BIC(modelo_caro$finalModel)
+
+ll_modelo   <- logLik(modelo_caro$finalModel)
+ll_nulo     <- logLik(glm(es_caro_f ~ 1, data = train_data, family = binomial))
+pseudo_r2   <- as.numeric(1 - ll_modelo / ll_nulo)
+
+bondad_df <- data.frame(
+  Métrica    = c("AIC", "BIC", "Pseudo R^2 (McFadden)",
+                 "Log-verosimilitud del modelo",
+                 "Log-verosimilitud nula"),
+  Valor      = round(c(aic_val, bic_val, pseudo_r2,
+                       as.numeric(ll_modelo),
+                       as.numeric(ll_nulo)), 4)
+)
+
+kable(bondad_df, caption = "Métricas de bondad de ajuste") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+El Pseudo R² de McFadden de 0.2805 indica un buen ajuste del modelo. En regresión logística, valores entre 0.20 y 0.40 se consideran satisfactorios, por lo que este resultado confirma que los predictores seleccionados capturan una proporción considerable de la variabilidad en la clasificación de precios. La reducción en la log-verosimilitud respecto al modelo nulo, que pasó de −34,234 a −24,631, muestra que incluir los predictores mejora sustancialmente la capacidad explicativa del modelo frente a simplemente predecir la categoría más frecuente.
