@@ -310,3 +310,91 @@ kable(bondad_df, caption = "Métricas de bondad de ajuste") %>%
 ```
 
 El Pseudo R² de McFadden de 0.2805 indica un buen ajuste del modelo. En regresión logística, valores entre 0.20 y 0.40 se consideran satisfactorios, por lo que este resultado confirma que los predictores seleccionados capturan una proporción considerable de la variabilidad en la clasificación de precios. La reducción en la log-verosimilitud respecto al modelo nulo, que pasó de −34,234 a −24,631, muestra que incluir los predictores mejora sustancialmente la capacidad explicativa del modelo frente a simplemente predecir la categoría más frecuente.
+
+```{r}
+# Inciso No. 5
+## Evaluación del modelo en el conjunto de prueba
+
+metricas_prueba <- data.frame(
+  Métrica = c("Exactitud (Accuracy)", "Sensibilidad (Recall)", 
+              "Especificidad", "Precisión", "F1-Score", "AUC-ROC"),
+  Valor = round(c(
+    cm_test$overall["Accuracy"],
+    cm_test$byClass["Sensitivity"],
+    cm_test$byClass["Specificity"],
+    cm_test$byClass["Precision"],
+    cm_test$byClass["F1"],
+    modelo_caro$results$ROC
+  ), 4)
+)
+
+kable(metricas_prueba, caption = "Métricas de eficiencia – conjunto de prueba") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+El modelo alcanzó una exactitud del 78.47% en el conjunto de prueba. La especificidad alta (88.97%) indica que clasifica bien las propiedades no caras, pero la sensibilidad baja (57.87%) revela que el modelo falla en detectar el 42% de las propiedades caras. El AUC de 0.8386 confirma buena capacidad discriminativa global. El F1-Score de 0.6447 refleja el desbalance entre precisión y sensibilidad, sugiriendo que el umbral de 0.5 no es óptimo para este conjunto de datos.
+
+```{r}
+# Inciso No. 6
+## Sobreajuste y curvas de aprendizaje
+
+proporciones <- seq(0.10, 1.0, by = 0.10)
+resultados_curva <- data.frame()
+
+set.seed(123)
+
+for (p in proporciones) {
+  n_sub <- floor(p * nrow(train_data))
+  idx_sub <- sample(seq_len(nrow(train_data)), size = n_sub, replace = FALSE)
+  sub_train <- train_data[idx_sub, ]
+  
+  modelo_temp <- glm(
+    es_caro_f ~ accommodates + bedrooms + beds + bathrooms +
+                room_type + minimum_nights + availability_365 +
+                number_of_reviews + review_scores_rating +
+                reviews_per_month + calculated_host_listings_count +
+                host_is_superhost_n + instant_bookable_n,
+    data   = sub_train,
+    family = binomial
+  )
+  
+  # Error en entrenamiento
+  prob_tr  <- predict(modelo_temp, newdata = sub_train, type = "response")
+  pred_tr  <- ifelse(prob_tr >= 0.5, "Si", "No")
+  error_tr <- mean(pred_tr != as.character(sub_train$es_caro_f))
+  
+  # Error en prueba
+  prob_te  <- predict(modelo_temp, newdata = test_data, type = "response")
+  pred_te  <- ifelse(prob_te >= 0.5, "Si", "No")
+  error_te <- mean(pred_te != as.character(test_data$es_caro_f))
+  
+  resultados_curva <- rbind(resultados_curva, data.frame(
+    Proporcion        = p,
+    N_train           = n_sub,
+    Error_train       = error_tr,
+    Error_prueba      = error_te
+  ))
+}
+
+# Tabla de resultados
+kable(resultados_curva, 
+      digits  = 4,
+      caption = "Errores de entrenamiento y prueba por tamaño de muestra") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# Gráfico de curvas de aprendizaje
+plot(resultados_curva$Proporcion, resultados_curva$Error_train,
+     type  = "b", col = "steelblue", pch = 16,
+     ylim  = c(0, 0.5),
+     xlab  = "Proporción del conjunto de entrenamiento",
+     ylab  = "Error de clasificación",
+     main  = "Curvas de Aprendizaje – Regresión Logística",
+     xaxt  = "n")
+axis(1, at = proporciones, labels = paste0(proporciones * 100, "%"))
+lines(resultados_curva$Proporcion, resultados_curva$Error_prueba,
+      type = "b", col = "tomato", pch = 17)
+legend("topright",
+       legend = c("Error entrenamiento", "Error prueba"),
+       col    = c("steelblue", "tomato"),
+       pch    = c(16, 17), lty = 1)
+```
+Las curvas de aprendizaje confirman la ausencia de sobreajuste: el error de entrenamiento (~0.21) y el error de prueba (~0.215) son prácticamente idénticos en todos los tamaños de muestra, con una brecha máxima de 0.005. Ambas curvas convergen desde el 10% de los datos, lo que indica que el modelo alcanza su capacidad máxima con pocas observaciones y que agregar más datos no mejora significativamente el rendimiento
