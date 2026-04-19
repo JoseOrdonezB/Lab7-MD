@@ -17,6 +17,11 @@ library(knitr)
 library(kableExtra)
 library(car)
 library(corrplot)
+library(glmnet)
+library(profvis)
+library(pROC)
+library(ggplot2)
+
 ```
 
 
@@ -398,3 +403,127 @@ legend("topright",
        pch    = c(16, 17), lty = 1)
 ```
 Las curvas de aprendizaje confirman la ausencia de sobreajuste: el error de entrenamiento (~0.21) y el error de prueba (~0.215) son prácticamente idénticos en todos los tamaños de muestra, con una brecha máxima de 0.005. Ambas curvas convergen desde el 10% de los datos, lo que indica que el modelo alcanza su capacidad máxima con pocas observaciones y que agregar más datos no mejora significativamente el rendimiento
+
+# Inciso 7
+## Tuneo del modelo
+```{r tuneo-setup}
+X_train <- model.matrix(es_caro_f ~ accommodates + bedrooms + beds + bathrooms +
+                          room_type + minimum_nights + availability_365 +
+                          number_of_reviews + review_scores_rating +
+                          reviews_per_month + calculated_host_listings_count +
+                          host_is_superhost_n + instant_bookable_n,
+                        data = train_data)[, -1]
+
+X_test <- model.matrix(es_caro_f ~ accommodates + bedrooms + beds + bathrooms +
+                          room_type + minimum_nights + availability_365 +
+                          number_of_reviews + review_scores_rating +
+                          reviews_per_month + calculated_host_listings_count +
+                          host_is_superhost_n + instant_bookable_n,
+                        data = test_data)[, -1]
+
+y_train <- ifelse(train_data$es_caro_f == "Si", 1, 0)
+y_test  <- ifelse(test_data$es_caro_f  == "Si", 1, 0)
+```
+
+```{r tuneo-alphas}
+set.seed(123)
+alphas  <- seq(0, 1, by = 0.1)
+
+modelos <- lapply(alphas, function(a) {
+  cv.glmnet(X_train, y_train, family = "binomial",
+            alpha = a, nfolds = 10, type.measure = "auc")
+})
+```
+Se probaron 11 valores de alpha entre 0 y 1 en pasos de 0.1, cubriendo el espectro completo desde Ridge puro hasta Lasso puro. Para cada valor de alpha, se utilizó validación cruzada de 10 pliegues para encontrar el lambda óptimo que maximiza el AUC.
+
+```{r predicción}
+auc_vec <- sapply(modelos, function(m) {
+  prob <- predict(m, newx = X_test, s = "lambda.min", type = "response")[, 1]
+  as.numeric(auc(roc(y_test, prob, quiet = TRUE)))
+})
+
+prob_base <- predict(modelo_caro, newdata = test_data, type = "prob")[, "Si"]
+auc_base  <- as.numeric(auc(roc(y_test, prob_base, quiet = TRUE)))
+```
+Una vez entrenados todos los modelos, se calcula el AUC de cada uno sobre el conjunto de prueba. También se calcula el AUC del modelo base sin regularización para tener un punto de comparación.
+
+```{r comparación}
+resultados_tuneo <- data.frame(
+  Modelo = c("Sin regularización", paste0("Elastic Net α=", alphas)),
+  AUC = round(c(auc_base, auc_vec), 4)
+)
+
+mejor_idx <- which.max(resultados_tuneo$AUC)
+cv_best <- modelos[[mejor_idx - 1]]
+mejor_alpha <- alphas[mejor_idx - 1]
+lambda_best <- cv_best$lambda.min
+
+cat("Mejor alpha:", mejor_alpha, "\n")
+cat("Lambda óptimo:", round(lambda_best, 6), "\n")
+
+kable(resultados_tuneo,
+      caption = "Comparación de AUC por tipo de regularización") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(mejor_idx, background = "#d4edda", bold = TRUE)
+```
+El mejor modelo resultó ser un Elastic Net con α=0.1, lo que indica una regularización predominantemente Ridge con una pequeña componente Lasso. El lambda óptimo de 0.001206 es un valor muy pequeño, lo que sugiere que el modelo base ya estaba bien ajustado y solo necesitaba una penalización leve para mejorar su generalización.
+
+# Inciso 8
+## Eficiencia del modelo
+```{r matriz-confusión}
+pred_test <- predict(modelo_caro, newdata = test_data, type = "raw")
+cm_test   <- confusionMatrix(pred_test, test_data$es_caro_f, positive = "Si")
+
+TP <- cm_test$table["Si", "Si"]
+TN <- cm_test$table["No", "No"]
+FP <- cm_test$table["Si", "No"]
+FN <- cm_test$table["No", "Si"]
+
+acc <- round(cm_test$overall["Accuracy"], 4)
+sens <- round(cm_test$byClass["Sensitivity"], 4)
+spec <- round(cm_test$byClass["Specificity"], 4)
+prec <- round(cm_test$byClass["Precision"], 4)
+f1 <- round(cm_test$byClass["F1"], 4)
+fpr <- round(FP / (FP + TN), 4)
+fnr <- round(FN / (FN + TP), 4)
+
+cat("Exactitud:", acc,  "| Sensibilidad:", sens, "| Especificidad:", spec, "\n")
+cat("Precisión:", prec, "| F1-Score:",     f1,   "| AUC-ROC:",       round(auc_base, 4), "\n")
+cat("FPR:",       fpr,  "| FNR:",          fnr,  "\n")
+cat("TP:", TP, "| TN:", TN, "| FP:", FP, "| FN:", FN, "\n")
+
+cm_df <- as.data.frame(cm_test$table)
+
+ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
+  scale_fill_gradient(low = "#d4edda", high = "#1a7a4a") +
+  labs(title = "Matriz de Confusión – Modelo Base (umbral = 0.5)",
+       x = "Valor Real", y = "Predicción", fill = "Frecuencia") +
+  theme_minimal()
+```
+El modelo alcanzó una exactitud del 78.47%, lo que a primera vista parece aceptable, pero al analizar las métricas individuales emerge un desbalance importante. La especificidad es alta (88.97%), lo que indica que el modelo identifica bien las propiedades que no son caras. Sin embargo, la sensibilidad es considerablemente más baja (57.87%), lo que significa que el modelo falla en detectar casi el 42% de las propiedades caras, reflejado en los 3,252 falsos negativos. El F1-Score de 0.6447 confirma este desbalance entre precisión y sensibilidad. El AUC-ROC de 0.8371 indica una buena capacidad discriminativa global, pero el umbral de 0.5 claramente no es el óptimo para este conjunto de datos, ya que favorece la clasificación de propiedades como "no caras" en detrimento de detectar las caras.
+
+```{r}
+tiempo_base <- system.time({
+  prob <- predict(modelo_caro, newdata = test_data, type = "prob")[, "Si"]
+  pred <- factor(ifelse(prob >= 0.5, "Si", "No"), levels = c("No", "Si"))
+  confusionMatrix(pred, test_data$es_caro_f, positive = "Si")
+})
+
+tiempo_reg <- system.time({
+  prob <- predict(cv_best, newx = X_test, s = "lambda.min", type = "response")[, 1]
+  pred <- factor(ifelse(prob >= 0.5, "Si", "No"), levels = c("No", "Si"))
+  confusionMatrix(pred, factor(y_test, levels = c(0,1), labels = c("No","Si")), positive = "Si")
+})
+
+data.frame(
+  Modelo   = c("Base (sin regularización)", "Elastic Net (α=0.1)"),
+  Tiempo_s = c(tiempo_base["elapsed"], tiempo_reg["elapsed"]),
+  Memoria  = c(format(object.size(modelo_caro), units = "Mb"),
+               format(object.size(cv_best),     units = "Mb"))
+)
+```
+La comparación de tiempo y memoria entre ambos modelos revela diferencias importantes. El modelo base tardó 0.074 segundos en generar predicciones y ocupa 1.1 Mb en memoria, mientras que el modelo regularizado Elastic Net fue casi el doble de rápido con 0.039 segundos y prácticamente no ocupa memoria almacenada como objeto. Esto se debe a que cv.glmnet no guarda toda la infraestructura de caret (preprocesamiento, validación cruzada, metadata), sino únicamente los coeficientes necesarios para predecir, lo que lo hace más eficiente. En términos de velocidad y memoria, el modelo regularizado es claramente superior.
+
+
