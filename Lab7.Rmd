@@ -21,7 +21,7 @@ library(glmnet)
 library(profvis)
 library(pROC)
 library(ggplot2)
-
+library(pROC)
 ```
 
 
@@ -526,4 +526,217 @@ data.frame(
 ```
 La comparación de tiempo y memoria entre ambos modelos revela diferencias importantes. El modelo base tardó 0.074 segundos en generar predicciones y ocupa 1.1 Mb en memoria, mientras que el modelo regularizado Elastic Net fue casi el doble de rápido con 0.039 segundos y prácticamente no ocupa memoria almacenada como objeto. Esto se debe a que cv.glmnet no guarda toda la infraestructura de caret (preprocesamiento, validación cruzada, metadata), sino únicamente los coeficientes necesarios para predecir, lo que lo hace más eficiente. En términos de velocidad y memoria, el modelo regularizado es claramente superior.
 
+# Inciso No. 9
+## Optimización del umbral de decisión
+```{r umbral}
+# Curva ROC
+roc_obj <- roc(y_test, prob_caro_test, quiet = TRUE)
 
+coords_all <- coords(roc_obj, "all",
+                     ret = c("threshold", "sensitivity", "specificity"),
+                     transpose = FALSE)
+
+# Índice de Youden = Sensibilidad + Especificidad - 1
+coords_all$youden <- coords_all$sensitivity + coords_all$specificity - 1
+
+mejor_fila  <- which.max(coords_all$youden)
+umbral_opt  <- coords_all$threshold[mejor_fila]
+sens_opt    <- coords_all$sensitivity[mejor_fila]
+esp_opt     <- coords_all$specificity[mejor_fila]
+youden_opt  <- coords_all$youden[mejor_fila]
+
+cat(sprintf("Umbral óptimo (Youden): %.4f\n", umbral_opt))
+cat(sprintf("Sensibilidad:           %.4f\n", sens_opt))
+cat(sprintf("Especificidad:          %.4f\n", esp_opt))
+cat(sprintf("Índice de Youden:       %.4f\n", youden_opt))
+```
+
+```{r curva roc}
+plot(roc_obj,
+     col  = "steelblue",
+     lwd  = 2,
+     main = paste0("Curva ROC – AUC = ", round(auc(roc_obj), 4)))
+
+points(1 - esp_opt, sens_opt,
+       col = "tomato", pch = 19, cex = 2)
+
+text(1 - esp_opt + 0.05, sens_opt - 0.04,
+     labels = paste0("Óptimo\nu = ", round(umbral_opt, 3)),
+     col = "tomato", cex = 0.85)
+
+legend("bottomright",
+       legend = c("Curva ROC",
+                  paste0("Punto óptimo (u = ", round(umbral_opt, 3), ")")),
+       col    = c("steelblue", "tomato"),
+       lty    = c(1, NA), pch = c(NA, 19), lwd = c(2, NA))
+```
+El índice de Youden identificó 0.322 como el umbral óptimo de decisión, bastante por debajo
+del 0.5 convencional. Esto ya era una señal de que el modelo, con el umbral por defecto,
+estaba siendo demasiado exigente para etiquetar una propiedad como cara, dejando escapar
+una gran cantidad de casos positivos reales.
+
+```{r curva youden}
+umbrales_plot <- coords_all[coords_all$threshold >= 0 &
+                              coords_all$threshold <= 1, ]
+
+plot(umbrales_plot$threshold, umbrales_plot$sensitivity,
+     type = "l", col = "steelblue", lwd = 2,
+     ylim = c(0, 1),
+     xlab = "Umbral de decisión",
+     ylab = "Valor",
+     main = "Sensibilidad, Especificidad e Índice de Youden por Umbral")
+
+lines(umbrales_plot$threshold, umbrales_plot$specificity,
+      col = "forestgreen", lwd = 2)
+
+lines(umbrales_plot$threshold, umbrales_plot$youden,
+      col = "tomato", lwd = 2, lty = 2)
+
+abline(v = umbral_opt, lty = 3, col = "gray40")
+
+legend("right",
+       legend = c("Sensibilidad", "Especificidad", "Youden"),
+       col    = c("steelblue", "forestgreen", "tomato"),
+       lty    = c(1, 1, 2), lwd = 2)
+```
+El gráfico de sensibilidad y especificidad por umbral lo ilustra con claridad: ambas curvas
+se cruzan aproximadamente en 0.322, que es exactamente donde el índice de Youden alcanza
+su punto máximo de 0.5195. A partir de ese punto, bajar más el umbral seguiría ganando
+sensibilidad, pero la especificidad caería de forma pronunciada, y subirlo haría lo contrario.
+
+```{r umbral optimo}
+pred_opt <- factor(ifelse(prob_caro_test >= umbral_opt, "Si", "No"),
+                   levels = c("No", "Si"))
+
+cm_opt <- confusionMatrix(pred_opt, test_data$es_caro_f, positive = "Si")
+print(cm_opt)
+
+cm_opt_df <- as.data.frame(cm_opt$table)
+
+ggplot(cm_opt_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
+  scale_fill_gradient(low = "#dbeafe", high = "#1d4ed8") +
+  labs(title = paste0("Matriz de Confusión – Umbral Óptimo (",
+                      round(umbral_opt, 3), ")"),
+       x = "Valor Real", y = "Predicción", fill = "Frecuencia") +
+  theme_minimal()
+```
+Al aplicar este umbral, los resultados cambian de manera notable. La sensibilidad sube de 0.5787 a 0.7457, lo que significa que el modelo ahora detecta correctamente la mayoría de las propiedades realmente caras, frente al 58% que lograba antes. Este avance tiene un costo: la especificidad baja de 0.8897 a 0.7738, y los falsos positivos aumentan de 1,672 a 3,428. Sin embargo, los falsos negativos se reducen de 3,252 a 1,963, lo cual es el tipo de error que más importa en este contexto. 
+Para SmartStay, clasificar incorrectamente una propiedad como cara cuando no lo es implica una recomendación equivocada al cliente, pero no detectar una propiedad realmente cara significa perder el incentivo económico que Airbnb ofrece por incrementar la ocupación de esas unidades. Ese segundo error es más costoso para el negocio.
+
+```{r comparacion umbrales}
+TP_05  <- cm_test$table["Si", "Si"]
+TN_05  <- cm_test$table["No", "No"]
+FP_05  <- cm_test$table["Si", "No"]
+FN_05  <- cm_test$table["No", "Si"]
+
+TP_opt <- cm_opt$table["Si", "Si"]
+TN_opt <- cm_opt$table["No", "No"]
+FP_opt <- cm_opt$table["Si", "No"]
+FN_opt <- cm_opt$table["No", "Si"]
+
+comp_umbrales <- data.frame(
+  Métrica        = c("Umbral", "Exactitud", "Sensibilidad",
+                     "Especificidad", "Precisión", "F1-Score",
+                     "Falsos Positivos (FP)", "Falsos Negativos (FN)",
+                     "Índice de Youden"),
+  `Umbral 0.5`   = c(0.5,
+                     round(cm_test$overall["Accuracy"],      4),
+                     round(cm_test$byClass["Sensitivity"],   4),
+                     round(cm_test$byClass["Specificity"],   4),
+                     round(cm_test$byClass["Precision"],     4),
+                     round(cm_test$byClass["F1"],            4),
+                     FP_05, FN_05,
+                     round(cm_test$byClass["Sensitivity"] +
+                           cm_test$byClass["Specificity"] - 1, 4)),
+  `Umbral Óptimo` = c(round(umbral_opt, 4),
+                      round(cm_opt$overall["Accuracy"],     4),
+                      round(cm_opt$byClass["Sensitivity"],  4),
+                      round(cm_opt$byClass["Specificity"],  4),
+                      round(cm_opt$byClass["Precision"],    4),
+                      round(cm_opt$byClass["F1"],           4),
+                      FP_opt, FN_opt,
+                      round(youden_opt, 4))
+)
+
+kable(comp_umbrales,
+      caption = "Comparación entre umbral 0.5 y umbral óptimo (Youden)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(c(3, 4, 9), background = "#fff3cd")
+```
+El F1-Score también mejora, pasando de 0.6447 a 0.6811, lo que confirma que el umbral
+óptimo ofrece un mejor balance global entre precisión y recall. Por todo lo anterior, el
+umbral de 0.322 es claramente preferible al de 0.5 para este conjunto de datos.
+
+# Inciso No. 10
+## Selección del mejor modelo
+```{r comparacion de modelos}
+prob_reg_test <- predict(cv_best, newx = X_test,
+                         s = "lambda.min", type = "response")[, 1]
+
+pred_reg_05 <- factor(ifelse(prob_reg_test >= 0.5, "Si", "No"),
+                      levels = c("No", "Si"))
+cm_reg_05   <- confusionMatrix(pred_reg_05, test_data$es_caro_f, positive = "Si")
+
+umbral_reg_roc    <- roc(y_test, prob_reg_test, quiet = TRUE)
+umbral_reg_coords <- coords(umbral_reg_roc, "best",
+                            ret = c("threshold","sensitivity","specificity"),
+                            best.method = "youden", transpose = FALSE)
+umbral_reg_opt    <- umbral_reg_coords$threshold[1]
+
+pred_reg_opt <- factor(ifelse(prob_reg_test >= umbral_reg_opt, "Si", "No"),
+                       levels = c("No", "Si"))
+cm_reg_opt   <- confusionMatrix(pred_reg_opt, test_data$es_caro_f, positive = "Si")
+
+aic_base <- round(AIC(modelo_caro$finalModel), 2)
+bic_base <- round(BIC(modelo_caro$finalModel), 2)
+
+tabla_final <- data.frame(
+  Modelo         = c("GLM base (u=0.5)",
+                     "GLM base (u óptimo)",
+                     "Elastic Net α=0.1 (u=0.5)",
+                     "Elastic Net α=0.1 (u óptimo)"),
+  AIC            = c(aic_base, aic_base, "—", "—"),
+  BIC            = c(bic_base, bic_base, "—", "—"),
+  AUC            = round(c(auc_base, auc_base,
+                           as.numeric(auc(umbral_reg_roc)),
+                           as.numeric(auc(umbral_reg_roc))), 4),
+  Exactitud      = round(c(cm_test$overall["Accuracy"],
+                           cm_opt$overall["Accuracy"],
+                           cm_reg_05$overall["Accuracy"],
+                           cm_reg_opt$overall["Accuracy"]), 4),
+  Sensibilidad   = round(c(cm_test$byClass["Sensitivity"],
+                           cm_opt$byClass["Sensitivity"],
+                           cm_reg_05$byClass["Sensitivity"],
+                           cm_reg_opt$byClass["Sensitivity"]), 4),
+  Especificidad  = round(c(cm_test$byClass["Specificity"],
+                           cm_opt$byClass["Specificity"],
+                           cm_reg_05$byClass["Specificity"],
+                           cm_reg_opt$byClass["Specificity"]), 4),
+  F1             = round(c(cm_test$byClass["F1"],
+                           cm_opt$byClass["F1"],
+                           cm_reg_05$byClass["F1"],
+                           cm_reg_opt$byClass["F1"]), 4),
+  Tiempo_s       = c(round(tiempo_base["elapsed"], 4),
+                     round(tiempo_base["elapsed"], 4),
+                     round(tiempo_reg["elapsed"],  4),
+                     round(tiempo_reg["elapsed"],  4))
+)
+
+mejor_fila_final <- which.max(tabla_final$F1)
+
+kable(tabla_final,
+      caption = "Comparación final de modelos logísticos binarios") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) %>%
+  row_spec(mejor_fila_final, bold = TRUE, background = "#d4edda")
+```
+Al comparar los cuatro modelos evaluados, lo primero que llama la atención es que el AUC es prácticamente idéntico en todos: 0.8371 para el modelo base y 0.8372 para el Elastic Net. Esto indica que la regularización no mejoró la capacidad discriminativa del modelo de manera significativa, lo que tiene sentido dado que los VIF eran bajos desde el principio y no había multicolinealidad severa que corregir.
+
+Donde sí se aprecian diferencias es en el F1-Score y en el balance entre sensibilidad y especificidad. Los dos modelos con umbral óptimo, tanto el GLM base como el Elastic Net, alcanzan un F1 de 0.6811, superando a sus versiones con umbral 0.5 que se quedan en 0.6447 y 0.6437 respectivamente. Esto confirma que el ajuste del umbral tiene más impacto práctico que la regularización en este caso.
+
+En cuanto al tiempo de procesamiento, el Elastic Net es más rápido en la predicción (0.04 segundos frente a 0.09 del modelo base), pero esa diferencia es marginal para un sistema en producción. El modelo base, en cambio, tiene la ventaja de ofrecer AIC y BIC como métricas de ajuste formales, que el Elastic Net no proporciona directamente.
+
+El modelo ganador es el GLM base con umbral óptimo de 0.322. No solo iguala el mejor F1 disponible, sino que mantiene coeficientes completamente interpretables, no presenta sobreajuste y sus métricas de bondad de ajuste, con un AIC de 49,294 y un Pseudo R^2 de McFadden de 0.28, respaldan que el modelo se adapta bien a los datos. Para SmartStay, la interpretabilidad no es un detalle menor: poder explicarle al equipo comercial por qué el modelo clasifica una propiedad como cara, citando variables concretas como el número de
+baños o el puntaje de reseñas, tiene un valor estratégico que un modelo de caja negra no puede ofrecer.
