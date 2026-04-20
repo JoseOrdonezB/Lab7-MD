@@ -22,6 +22,7 @@ library(profvis)
 library(pROC)
 library(ggplot2)
 library(pROC)
+library(nnet)
 ```
 
 
@@ -740,3 +741,135 @@ En cuanto al tiempo de procesamiento, el Elastic Net es más rápido en la predi
 
 El modelo ganador es el GLM base con umbral óptimo de 0.322. No solo iguala el mejor F1 disponible, sino que mantiene coeficientes completamente interpretables, no presenta sobreajuste y sus métricas de bondad de ajuste, con un AIC de 49,294 y un Pseudo R^2 de McFadden de 0.28, respaldan que el modelo se adapta bien a los datos. Para SmartStay, la interpretabilidad no es un detalle menor: poder explicarle al equipo comercial por qué el modelo clasifica una propiedad como cara, citando variables concretas como el número de
 baños o el puntaje de reseñas, tiene un valor estratégico que un modelo de caja negra no puede ofrecer.
+
+# Inciso 11
+```{r}
+# Variable respuesta como factor ordenado
+listings_clean$price_category <- factor(
+  listings_clean$price_category,
+  levels = c("economico", "medio", "caro")
+)
+
+train_data <- listings_clean[ train_index, ]
+test_data  <- listings_clean[-train_index, ]
+
+# Tuneo: probar distintos valores de decay (regularización)
+set.seed(123)
+
+ctrl_multi <- trainControl(
+  method          = "cv",
+  number          = 10,
+  classProbs      = TRUE,
+  savePredictions = "final"
+)
+
+grid_decay <- expand.grid(decay = c(0, 0.0001, 0.001, 0.01, 0.1, 0.5, 1))
+
+modelo_multi <- caret::train(
+  price_category ~ accommodates + bedrooms + beds + bathrooms +
+                   room_type + minimum_nights + availability_365 +
+                   number_of_reviews + review_scores_rating +
+                   reviews_per_month + calculated_host_listings_count +
+                   host_is_superhost_n + instant_bookable_n,
+  data      = train_data,
+  method    = "multinom",
+  trControl = ctrl_multi,
+  tuneGrid  = grid_decay,
+  metric    = "Accuracy",
+  trace     = FALSE
+)
+
+cat("=== Resultados de tuneo – decay ===\n")
+print(modelo_multi$results)
+cat("\nMejor decay:", modelo_multi$bestTune$decay, "\n")
+```
+El tuneo probó 7 valores de decay entre 0 y 1. Los valores bajos (0 a 0.01) obtuvieron
+el mejor accuracy de 0.6122 y Kappa de 0.4182, siendo 0.01 seleccionado como óptimo.
+A partir de decay=0.1 el rendimiento comienza a degradarse, confirmando que una
+regularización fuerte penaliza innecesariamente el modelo.
+
+```{r}
+# Evaluación en conjunto de prueba
+pred_multi <- predict(modelo_multi, newdata = test_data)
+cm_multi   <- confusionMatrix(pred_multi, test_data$price_category)
+print(cm_multi)
+
+cm_multi_df <- as.data.frame(cm_multi$table)
+
+ggplot(cm_multi_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "#dbeafe", high = "#1d4ed8") +
+  labs(title = "Matriz de Confusión – Regresión Logística Multinomial",
+       x = "Valor Real", y = "Predicción", fill = "Frecuencia") +
+  theme_minimal()
+```
+El modelo multinomial alcanzó un accuracy de 60.75% y Kappa de 0.4113, lo que indica
+concordancia moderada. La clase con mejor desempeño es "económico" con F1 de 0.6714,
+seguida de "caro" con 0.6745. La clase "medio" es la más difícil de clasificar, con una
+sensibilidad de apenas 0.4324 y F1 de 0.4622, lo cual es esperable: las propiedades de
+precio medio comparten características con ambos extremos, haciendo sus fronteras de
+decisión inherentemente menos definidas.
+
+```{r}
+# Métricas por clase
+metricas_multi <- data.frame(
+  Clase        = c("Económico", "Medio", "Caro"),
+  Sensibilidad = round(cm_multi$byClass[, "Sensitivity"], 4),
+  Especificidad= round(cm_multi$byClass[, "Specificity"], 4),
+  Precision    = round(cm_multi$byClass[, "Precision"],   4),
+  F1           = round(cm_multi$byClass[, "F1"],          4)
+)
+
+kable(metricas_multi,
+      caption = "Métricas por clase – Modelo Multinomial") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r}
+# Inciso No. 12
+## Comparación con modelos de entregas anteriores
+
+tiempo_multi <- system.time({
+  predict(modelo_multi, newdata = test_data)
+})
+
+acc_multi  <- round(cm_multi$overall["Accuracy"], 4)
+kappa_multi <- round(cm_multi$overall["Kappa"], 4)
+
+# F1 macro (promedio de las tres clases)
+f1_multi <- round(mean(cm_multi$byClass[, "F1"], na.rm = TRUE), 4)
+
+comparacion_final <- data.frame(
+  Modelo       = c("Naive Bayes", "KNN (k=31)", 
+                   "Árbol de Decisión", "Random Forest",
+                   "Reg. Logística Multinomial"),
+  Accuracy     = c(0.5886, 0.6661, 0.6896, 0.8593, acc_multi),
+  Kappa        = c(0.3549, 0.4414, NA,     0.7714, kappa_multi),
+  Tiempo_seg   = c(0.055,  NA,     0.517,  0.523,  
+                   round(tiempo_multi["elapsed"], 3))
+)
+
+mejor_acc <- which.max(comparacion_final$Accuracy)
+
+kable(comparacion_final,
+      caption = "Comparación de modelos de clasificación – todas las entregas") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(mejor_acc, bold = TRUE, background = "#d4edda")
+```
+Random Forest es el modelo con mejor desempeño con un accuracy de 85.93% y Kappa de
+0.7714, superando ampliamente al resto. La Regresión Logística Multinomial (60.75%)
+supera a Naive Bayes (58.86%) pero queda por debajo de KNN (66.61%) y Árbol de
+Decisión (68.96%).
+
+En cuanto a tiempo, la Regresión Logística Multinomial fue el segundo modelo más rápido
+con 0.13 segundos en predicción, solo por detrás de Naive Bayes (0.055s). Random Forest
+y Árbol de Decisión tomaron ~0.52 segundos.
+
+La regresión logística multinomial se equivocó más en la clase "medio", confundiendo
+2,257 propiedades económicas como medias y 2,049 medias como caras. Esto refleja una
+limitación estructural del modelo: al asumir relaciones lineales entre predictores y
+log-probabilidades, no captura las interacciones complejas que Random Forest sí puede
+modelar mediante particiones recursivas. Para SmartStay, si la prioridad es precisión,
+Random Forest es la elección; si se requiere interpretabilidad y velocidad, la regresión
+logística multinomial ofrece un balance razonable.
